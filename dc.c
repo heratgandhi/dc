@@ -22,6 +22,10 @@
 
 extern char  __data_start, __bss_start, _edata, _end; 
 
+/*
+ * There are two SSL contexts active at a time; between DC and PMU Player
+ * and between DC and PMU Dumper.
+ */ 
 BIO                *bio, *bio1;
 BIO                *sbio, *sbio1;
 SSL                *ssl = NULL, *ssl1 = NULL;
@@ -59,6 +63,11 @@ static int get_tcpr_state(struct tcpr_ip4 *state, int tcprsock,
 	return 0;
 }
 
+/*
+ * This function sends acknoledgements to the TCPR when DC receives
+ * data from PMU Player. If DC would stop sending the acknolegements then
+ * TCPR would stop forwarding packets to DC from PMU Player.
+ */ 
 long tcpr_feedback(BIO *bio,int cmd,const char *argp,int argi,
         long argl,long ret) {
 	long r = 1;
@@ -70,7 +79,7 @@ long tcpr_feedback(BIO *bio,int cmd,const char *argp,int argi,
 		state1.tcpr.hard.ack =
 			    htonl(ntohl(state1.tcpr.hard.ack) + ret);
 		if (send(tcpr_sock, &state1, sizeof(state1), 0) < 0) {
-			printf("Error sending callback!\n");
+			printf("Error in callback!\n");
 		}			
 	}	
 	return r;
@@ -148,10 +157,13 @@ static int resolve_address(struct sockaddr_in *addr, const char *host,
 }
 
 static int connect_to_peer(struct sockaddr_in *peeraddr, uint16_t bindport, int recovering) {
+
 	int s;
 	int yes = 1;
 	struct sockaddr_in self;
+
 	if(ssl == NULL) {
+		//Connect with PMU Player
 		ctx = SSL_CTX_new(SSLv23_client_method());
 		if(! SSL_CTX_load_verify_locations(ctx, CERT_FILE, NULL)) {
 			fprintf(stderr, "Error loading trust store\n");
@@ -191,13 +203,14 @@ static int connect_to_peer(struct sockaddr_in *peeraddr, uint16_t bindport, int 
 		BIO_set_fd(sbio, s, BIO_NOCLOSE);
 		SSL_set_bio(ssl, sbio, sbio);
 		BIO_set_callback(sbio,tcpr_feedback);
-		
+		//If the connection is not new then it is not required to do handshake again. 
 		if(!recovering) {			
 			SSL_connect(ssl);
 		}
 		setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 				
 	} else {
+		//Connect with PMU Dumper		
 		ctx1 = SSL_CTX_new(SSLv23_client_method());
 
 		if(! SSL_CTX_load_verify_locations(ctx1, CERT_FILE, NULL)) {
@@ -367,6 +380,7 @@ static int copy_data(struct tcpr_ip4 *state, struct log *log, int pullsock,
 	for (;;) {
 		nr = SSL_read(ssl,buffer,sizeof(buffer));
 		
+		//Take backup of data section and BSS
 		fp = fopen("bss_backup","wb");
 		fwrite(&__bss_start,1,&_end - &__bss_start,fp);
 		fclose(fp);
@@ -375,6 +389,13 @@ static int copy_data(struct tcpr_ip4 *state, struct log *log, int pullsock,
 		fwrite(&__data_start,1,&_edata - &__data_start,fp);
 		fclose(fp);
 		
+		/*
+		 * Sleep is put after taking backup because it helps to simulate
+		 * crash and recovery. If we would have not placed sleep then while
+		 * simulating crash, it might so happen that program was in the 
+		 * process of creating backup files. Therefore to prevent such 
+		 * errors we have put sleep.
+		 */ 
 		sleep(5);
 		
 		if (nr < 0) {			
@@ -392,6 +413,7 @@ static int copy_data(struct tcpr_ip4 *state, struct log *log, int pullsock,
 		for (n = 0; n < (size_t)nr; n += ns) {
 			ns = SSL_write(ssl1, &buffer[n], nr-n);
 			
+			//Take backup of data section and BSS
 			fp = fopen("bss_backup","wb");
 			fwrite(&__bss_start,1,&_end - &__bss_start,fp);
 			fclose(fp);
@@ -526,6 +548,7 @@ int main(int argc, char **argv) {
 			exit(EXIT_FAILURE);
 		}
 		
+		//Take backup of data section and BSS
 		fp = fopen("bss_backup","wb");
 		fwrite(&__bss_start,1,&_end - &__bss_start,fp);
 		fclose(fp);
@@ -539,7 +562,10 @@ int main(int argc, char **argv) {
 		perror("Getting TCPR state");
 		exit(EXIT_FAILURE);
 	}
-	
+	/*
+	 * After recovery DC makes new socket but backed up SSL context contains 
+	 * old socket so associate new socket with stored SSL context.  
+	 */ 
 	BIO_set_fd(sbio, pullsock, BIO_NOCLOSE);
 	printf("Copying data from source to sink.\n");
 	if (copy_data(&state, log, pullsock, pushsock, tcprsock) < 0) {
